@@ -4,8 +4,9 @@
 // for examples of AESM Requests.
 
 use crate::protobuf::aesm_proto::{
-    Request, Request_GetQuoteRequest, Request_InitQuoteRequest, Response,
-    Response_GetQuoteResponse, Response_InitQuoteResponse,
+    Request, Request_GetQuoteExRequest, Request_InitQuoteExRequest, Request_SelectAttKeyIDRequest,
+    Response, Response_GetQuoteExResponse, Response_InitQuoteExResponse,
+    Response_SelectAttKeyIDResponse,
 };
 use crate::syscall::{SGX_DUMMY_QUOTE, SGX_DUMMY_TI, SGX_QUOTE_SIZE, SGX_TI_SIZE};
 
@@ -17,58 +18,175 @@ use std::slice::{from_raw_parts, from_raw_parts_mut};
 use protobuf::Message;
 
 const AESM_SOCKET: &str = "/var/run/aesmd/aesm.socket";
+const TIMEOUT: u32 = 1_000_000;
 
-/// Fills the Target Info of the QE into the output buffer specified and
-/// returns the number of bytes written.
-fn get_ti(out_buf: &mut [u8]) -> Result<usize, Error> {
-    assert_eq!(out_buf.len(), SGX_TI_SIZE, "Invalid size of output buffer");
+// Specifies the protobuf Request type to communicate with AESMD.
+#[derive(Debug)]
+enum ReqType {
+    AkId,
+    TInfo,
+    KeySize,
+    Quote,
+}
 
-    // If unable to connect to the AESM daemon, return dummy value
-    let mut stream = match UnixStream::connect(AESM_SOCKET) {
-        Ok(s) => s,
-        Err(_) => {
-            out_buf.copy_from_slice(&SGX_DUMMY_TI);
-            return Ok(SGX_TI_SIZE);
-        }
-    };
+impl ReqType {
+    fn set_request(
+        &self,
+        report: Option<&[u8; 432]>,
+        akid: Option<Vec<u8>>,
+        size: Option<usize>,
+    ) -> Result<Request, Error> {
+        let mut req = Request::new();
 
-    // Set an Init Quote Request
-    let mut req = Request::new();
-    let mut msg = Request_InitQuoteRequest::new();
-    msg.set_timeout(1_000_000);
-    req.set_initQuoteReq(msg);
-
-    // Set up Writer
-    let mut buf_wrtr = vec![0u8; size_of::<u32>()];
-    match req.write_to_writer(&mut buf_wrtr) {
-        Ok(_) => {}
-        Err(e) => {
-            return Err(Error::new(
-                ErrorKind::InvalidInput,
-                format!("Invalid Init Quote Request: {:#?}", e),
-            ));
+        match self {
+            ReqType::AkId => {
+                let mut msg = Request_SelectAttKeyIDRequest::new();
+                msg.set_timeout(TIMEOUT);
+                req.set_selectAttKeyIDReq(msg);
+                Ok(req)
+            }
+            ReqType::TInfo => {
+                let akid = match akid {
+                    Some(a) => a,
+                    None => {
+                        return Err(Error::new(
+                            ErrorKind::Other,
+                            "no attestation key ID provided for setting Init Quote Ex request",
+                        ));
+                    }
+                };
+                let size = match size {
+                    Some(s) => s,
+                    None => {
+                        return Err(Error::new(
+                            ErrorKind::Other,
+                            "no key size provided for setting Init Quote Ex request",
+                        ));
+                    }
+                };
+                let mut msg = Request_InitQuoteExRequest::new();
+                msg.set_timeout(TIMEOUT);
+                msg.set_b_pub_key_id(true);
+                msg.set_att_key_id(akid);
+                msg.set_buf_size(size as u64);
+                req.set_initQuoteExReq(msg);
+                Ok(req)
+            }
+            ReqType::KeySize => {
+                let akid = match akid {
+                    Some(a) => a,
+                    None => {
+                        return Err(Error::new(
+                            ErrorKind::Other,
+                            "no attestation key ID provided for setting Init Quote Ex request to get key size",
+                        ));
+                    }
+                };
+                let mut msg = Request_InitQuoteExRequest::new();
+                msg.set_timeout(TIMEOUT);
+                msg.set_b_pub_key_id(false);
+                msg.set_att_key_id(akid);
+                req.set_initQuoteExReq(msg);
+                Ok(req)
+            }
+            ReqType::Quote => {
+                let report = match report {
+                    Some(r) => r,
+                    None => {
+                        return Err(Error::new(
+                            ErrorKind::Other,
+                            "no Report provided for setting Get Quote Ex request",
+                        ));
+                    }
+                };
+                let akid = match akid {
+                    Some(a) => a,
+                    None => {
+                        return Err(Error::new(
+                            ErrorKind::Other,
+                            "no attestation key ID provided for setting Get Quote Ex request",
+                        ));
+                    }
+                };
+                let mut msg = Request_GetQuoteExRequest::new();
+                msg.set_timeout(TIMEOUT);
+                msg.set_report(report.to_vec());
+                msg.set_att_key_id(akid);
+                msg.set_buf_size(SGX_QUOTE_SIZE as u32);
+                req.set_getQuoteExReq(msg);
+                Ok(req)
+            }
         }
     }
 
-    let req_len = (buf_wrtr.len() - size_of::<u32>()) as u32;
-    (&mut buf_wrtr[0..size_of::<u32>()]).copy_from_slice(&req_len.to_le_bytes());
+    fn send_request(&self, req: Request, mut stream: UnixStream) -> Result<Response, Error> {
+        // Set up writer
+        let mut buf_wrtr = vec![0u8; size_of::<u32>()];
+        match req.write_to_writer(&mut buf_wrtr) {
+            Ok(_) => {}
+            Err(e) => {
+                return Err(Error::new(
+                    ErrorKind::Other,
+                    format!("invalid protobuf Request: {:?}. Error: {:?}", req, e),
+                ));
+            }
+        }
 
-    // Send Request to AESM daemon
-    stream.write_all(&buf_wrtr)?;
-    stream.flush()?;
+        let req_len = (buf_wrtr.len() - size_of::<u32>()) as u32;
+        (&mut buf_wrtr[0..size_of::<u32>()]).copy_from_slice(&req_len.to_le_bytes());
 
-    // Receive Response
-    let mut res_len_bytes = [0u8; 4];
-    stream.read_exact(&mut res_len_bytes)?;
-    let res_len = u32::from_le_bytes(res_len_bytes);
+        // Send Request to AESM daemon
+        stream.write_all(&buf_wrtr)?;
+        stream.flush()?;
 
-    let mut res_bytes = vec![0; res_len as usize];
-    stream.read_exact(&mut res_bytes)?;
+        // Receive Response
+        let mut res_len_bytes = [0u8; 4];
+        stream.read_exact(&mut res_len_bytes)?;
+        let res_len = u32::from_le_bytes(res_len_bytes);
 
-    // Parse Response and extract TargetInfo
-    let mut pb_msg: Response = protobuf::parse_from_bytes(&res_bytes)?;
-    let res: Response_InitQuoteResponse = pb_msg.take_initQuoteRes();
-    let ti = res.get_targetInfo();
+        let mut res_bytes = vec![0; res_len as usize];
+        stream.read_exact(&mut res_bytes)?;
+
+        Ok(Message::parse_from_bytes(&res_bytes)?)
+    }
+}
+
+/// Gets Att Key ID
+fn get_ak_id() -> Result<Vec<u8>, Error> {
+    let stream = UnixStream::connect(AESM_SOCKET)?;
+
+    let r = ReqType::AkId;
+    let pb_req = r.set_request(None, None, None)?;
+    let mut pb_msg: Response = r.send_request(pb_req, stream)?;
+
+    let mut res: Response_SelectAttKeyIDResponse = pb_msg.take_selectAttKeyIDRes();
+
+    if res.get_errorCode() != 0 {
+        panic!(
+            "Received error code {:?} in Select Att Key ID Response",
+            res.get_errorCode()
+        );
+    }
+
+    let attkeyid = res.take_selected_att_key_id();
+    assert!(!attkeyid.is_empty());
+
+    Ok(attkeyid)
+}
+
+/// Fills the Target Info of the QE into the output buffer specified and
+/// returns the number of bytes written.
+fn get_ti(akid: Vec<u8>, size: usize, out_buf: &mut [u8]) -> Result<usize, Error> {
+    assert_eq!(out_buf.len(), SGX_TI_SIZE, "Invalid size of output buffer");
+
+    let stream = UnixStream::connect(AESM_SOCKET)?;
+
+    let r = ReqType::TInfo;
+    let pb_req = r.set_request(None, Some(akid), Some(size))?;
+    let mut pb_msg: Response = r.send_request(pb_req, stream)?;
+
+    let res: Response_InitQuoteExResponse = pb_msg.take_initQuoteExRes();
+    let ti = res.get_target_info();
 
     assert_eq!(
         ti.len(),
@@ -77,67 +195,48 @@ fn get_ti(out_buf: &mut [u8]) -> Result<usize, Error> {
     );
 
     out_buf.copy_from_slice(ti);
+
     Ok(ti.len())
+}
+
+/// Gets key size
+fn get_key_size(akid: Vec<u8>) -> Result<usize, Error> {
+    let stream = UnixStream::connect(AESM_SOCKET)?;
+
+    let r = ReqType::KeySize;
+    let pb_req = r.set_request(None, Some(akid), None)?;
+    let mut pb_msg: Response = r.send_request(pb_req, stream)?;
+
+    let res: Response_InitQuoteExResponse = pb_msg.take_initQuoteExRes();
+
+    if res.get_errorCode() != 0 {
+        panic!(
+            "Received error code {:?} in Init Quote Ex Response for key size",
+            res.get_errorCode()
+        );
+    }
+
+    Ok(res.get_pub_key_id_size() as usize)
 }
 
 /// Fills the Quote obtained from the AESMD for the Report specified into
 /// the output buffer specified and returns the number of bytes written.
-fn get_quote(report: &[u8], out_buf: &mut [u8]) -> Result<usize, std::io::Error> {
+fn get_quote(report: &[u8], akid: Vec<u8>, out_buf: &mut [u8]) -> Result<usize, Error> {
     assert_eq!(
         out_buf.len(),
         SGX_QUOTE_SIZE,
         "Invalid size of output buffer"
     );
 
-    // If unable to connect to the AESM daemon, return dummy value
-    let mut stream = match UnixStream::connect(AESM_SOCKET) {
-        Ok(s) => s,
-        Err(_) => {
-            out_buf.copy_from_slice(&SGX_DUMMY_QUOTE);
-            return Ok(SGX_QUOTE_SIZE);
-        }
-    };
+    let stream = UnixStream::connect(AESM_SOCKET)?;
 
-    // Set a Get Quote Request
-    let mut req = Request::new();
-    let mut msg = Request_GetQuoteRequest::new();
-    msg.set_report(report[0..432].to_vec());
-    msg.set_quote_type(0); // TODO: Fix this value
-    msg.set_spid([0u8; 16].to_vec()); // TODO: Fix this value
-    msg.set_buf_size(1244); // TODO: FIx this value
-    msg.set_timeout(1_000_000);
-    req.set_getQuoteReq(msg);
+    let r = ReqType::Quote;
+    let mut report_array = [0u8; 432];
+    report_array.copy_from_slice(&report[0..432]);
+    let req = r.set_request(Some(&report_array), Some(akid), None)?;
+    let mut pb_msg = r.send_request(req, stream)?;
 
-    // Set up Writer
-    let mut buf_wrtr = vec![0u8; size_of::<u32>()];
-    match req.write_to_writer(&mut buf_wrtr) {
-        Ok(_) => {}
-        Err(e) => {
-            return Err(Error::new(
-                ErrorKind::InvalidInput,
-                format!("Invalid Get Quote Request: {:#?}", e),
-            ));
-        }
-    }
-
-    let req_len = (buf_wrtr.len() - size_of::<u32>()) as u32;
-    (&mut buf_wrtr[0..size_of::<u32>()]).copy_from_slice(&req_len.to_le_bytes());
-
-    // Send Request to AESM daemon
-    stream.write_all(&buf_wrtr)?;
-    stream.flush()?;
-
-    // Receive Response
-    let mut res_len_bytes = [0u8; 4];
-    stream.read_exact(&mut res_len_bytes)?;
-    let res_len = u32::from_le_bytes(res_len_bytes);
-
-    let mut res_bytes = vec![0; res_len as usize];
-    stream.read_exact(&mut res_bytes)?;
-
-    // Parse Response and extract Quote
-    let mut pb_msg: Response = protobuf::parse_from_bytes(&res_bytes)?;
-    let res: Response_GetQuoteResponse = pb_msg.take_getQuoteRes();
+    let res: Response_GetQuoteExResponse = pb_msg.take_getQuoteExRes();
     if res.get_errorCode() != 0 {
         return Err(Error::new(
             ErrorKind::InvalidData,
@@ -172,11 +271,35 @@ pub fn get_attestation(
 ) -> Result<usize, Error> {
     let out_buf: &mut [u8] = unsafe { from_raw_parts_mut(buf as *mut u8, buf_len) };
 
+    // If unable to connect to the AESM daemon, return expected dummy value specified
+    // by nonce.
+    // TODO: This should be changed to indicate no connection could be made, but to
+    // also still run the tests. See https://github.com/enarx/enarx-keepldr/issues/228.
+    if UnixStream::connect(AESM_SOCKET).is_err() {
+        match nonce {
+            // Returns dummy TargetInfo
+            0 => {
+                out_buf.copy_from_slice(&SGX_DUMMY_TI);
+                return Ok(SGX_TI_SIZE);
+            }
+            // Returns dummy Quote
+            _ => {
+                out_buf.copy_from_slice(&SGX_DUMMY_QUOTE);
+                return Ok(SGX_QUOTE_SIZE);
+            }
+        }
+    };
+
+    // Returns TargetInfo
     if nonce == 0 {
-        get_ti(out_buf)
+        let akid = get_ak_id().expect("error obtaining att key id");
+        let pkeysize = get_key_size(akid.clone()).expect("error obtaining key size");
+        get_ti(akid, pkeysize, out_buf)
+    // Returns Quote
     } else {
+        let akid = get_ak_id().unwrap();
         let report: &[u8] = unsafe { from_raw_parts(nonce as *const u8, nonce_len) };
-        get_quote(report, out_buf)
+        get_quote(report, akid, out_buf)
     }
 }
 
@@ -186,31 +309,31 @@ mod tests {
 
     // These values were generated by the QE in its TargetInfo.
     const EXPECTED_MRENCLAVE: [u8; 32] = [
-        0xb2, 0xc1, 0xfe, 0x35, 0x7d, 0x7b, 0x10, 0x20, 0x54, 0x4f, 0xac, 0x33, 0x64, 0xc3, 0xf9,
-        0xb8, 0x98, 0xc1, 0x75, 0x8d, 0xb4, 0x1, 0x1e, 0x9d, 0x65, 0x2e, 0x40, 0xec, 0xd1, 0x86,
-        0x14, 0xbc,
+        96, 216, 90, 242, 139, 232, 209, 196, 10, 8, 217, 139, 0, 157, 95, 138, 204, 19, 132, 163,
+        133, 207, 70, 8, 0, 228, 120, 121, 29, 26, 151, 156,
     ];
 
     const SAMPLE_REPORT: [u8; 512] = [
-        3, 9, 255, 255, 2, 255, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        15, 15, 2, 6, 255, 128, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
         0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 5, 0, 0, 0, 0, 0, 0, 0, 3, 0,
-        0, 0, 0, 0, 0, 0, 22, 58, 88, 16, 125, 53, 233, 100, 17, 24, 200, 65, 26, 64, 74, 60, 66,
-        222, 31, 118, 51, 69, 13, 209, 195, 223, 173, 140, 243, 230, 253, 139, 0, 0, 0, 0, 0, 0, 0,
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 177, 61, 135,
-        106, 93, 83, 83, 127, 211, 215, 39, 124, 55, 194, 56, 135, 20, 122, 50, 245, 219, 208, 129,
-        97, 51, 211, 47, 101, 75, 245, 153, 123, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 53, 12, 244, 19, 178, 216, 108, 13, 226, 128, 62, 17, 136, 84, 160, 234,
+        114, 79, 206, 50, 26, 104, 135, 230, 61, 162, 75, 160, 62, 93, 17, 20, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 230, 142, 12,
+        124, 137, 239, 112, 240, 108, 198, 110, 200, 219, 184, 157, 182, 7, 132, 196, 236, 98, 135,
+        85, 216, 184, 203, 101, 55, 254, 171, 182, 226, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
         0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
         0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
         0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
         0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
         0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
         0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 223, 31,
-        156, 246, 241, 143, 199, 153, 178, 215, 41, 71, 144, 22, 86, 106, 0, 0, 0, 0, 0, 0, 0, 0,
-        0, 0, 0, 0, 0, 0, 0, 0, 50, 201, 146, 54, 60, 3, 200, 185, 0, 187, 66, 32, 117, 71, 150,
-        242, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
         0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        15, 10, 69, 122, 226, 2, 219, 184, 5, 155, 156, 48, 21, 246, 98, 237, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 101, 233, 135, 87, 211, 239, 8, 220, 56, 160, 173, 38, 74, 191,
+        131, 181, 168, 241, 128, 248, 59, 86, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 232, 225, 127, 248, 59,
+        86, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 234, 225, 127, 248, 59, 86, 0, 0, 190, 15, 1, 0, 0, 0, 0,
+        0, 234, 225, 127, 248, 59, 86, 0, 0, 190, 15, 1, 0, 0, 0, 0, 0, 232, 225, 127, 248, 59, 86,
+        0, 0, 2, 0, 0, 0, 0, 0, 0, 0,
     ];
 
     #[test]

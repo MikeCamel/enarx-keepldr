@@ -26,6 +26,7 @@ pub mod gdt;
 pub mod hostcall;
 /// Shared components for the shim and the loader
 pub mod hostlib;
+pub mod hostmap;
 pub mod no_std;
 pub mod pagetables;
 pub mod paging;
@@ -43,13 +44,14 @@ use crate::hostlib::BootInfo;
 use crate::pagetables::switch_sallyport_to_unencrypted;
 use crate::paging::SHIM_PAGETABLE;
 use crate::payload::PAYLOAD_VIRT_ADDR;
+use crate::print::{enable_printing, is_printing_enabled};
 use core::convert::TryFrom;
 use core::mem::size_of;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use primordial::Address;
 use sallyport::Block;
 use spinning::RwLock;
-use x86_64::structures::paging::MapperAllSizes;
+use x86_64::structures::paging::Translate;
 use x86_64::VirtAddr;
 
 static C_BIT_MASK: AtomicU64 = AtomicU64::new(0);
@@ -60,7 +62,6 @@ static BOOT_INFO: RwLock<Option<BootInfo>> =
 static SHIM_HOSTCALL_PHYS_ADDR: RwLock<Option<usize>> =
     RwLock::<Option<usize>>::const_new(spinning::RawRwLock::const_new(), None);
 
-static mut SHIM_CAN_PRINT: AtomicBool = AtomicBool::new(false);
 static mut PAYLOAD_READY: AtomicBool = AtomicBool::new(false);
 
 /// Get the SEV C-Bit mask
@@ -124,6 +125,9 @@ macro_rules! entry_point {
 
             switch_sallyport_to_unencrypted(c_bit_mask);
 
+            // Everything setup, so print works
+            enable_printing();
+
             // Switch the stack to a guarded stack
             switch_shim_stack(f, gdt::INITIAL_STACK.pointer.as_u64())
         }
@@ -134,13 +138,7 @@ entry_point!(shim_main);
 
 /// The entry point for the shim
 pub extern "C" fn shim_main() -> ! {
-    unsafe {
-        // Everything setup, so print works
-        SHIM_CAN_PRINT.store(true, Ordering::Relaxed);
-
-        gdt::init();
-    }
-
+    unsafe { gdt::init() };
     payload::execute_payload()
 }
 
@@ -158,7 +156,7 @@ pub fn panic(info: &core::panic::PanicInfo) -> ! {
 
     // Don't print anything, if the FRAME_ALLOCATOR is not yet initialized
     unsafe {
-        if SHIM_CAN_PRINT.load(Ordering::Relaxed)
+        if is_printing_enabled()
             && ALREADY_IN_PANIC
                 .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
                 .is_ok()

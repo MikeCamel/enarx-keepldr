@@ -18,8 +18,10 @@ use sgx::{
 };
 use sgx_heap::Heap;
 use syscall::{
-    SyscallHandler, ARCH_GET_FS, ARCH_GET_GS, ARCH_SET_FS, ARCH_SET_GS, SGX_DUMMY_QUOTE,
-    SGX_DUMMY_TI, SGX_QUOTE_SIZE, SGX_TECH, SYS_ENARX_CPUID, SYS_ENARX_GETATT,
+    BaseSyscallHandler, EnarxSyscallHandler, FileSyscallHandler, MemorySyscallHandler,
+    NetworkSyscallHandler, ProcessSyscallHandler, SyscallHandler, SystemSyscallHandler,
+    ARCH_GET_FS, ARCH_GET_GS, ARCH_SET_FS, ARCH_SET_GS, SGX_DUMMY_QUOTE, SGX_DUMMY_TI,
+    SGX_QUOTE_SIZE, SGX_TECH, SYS_ENARX_CPUID, SYS_ENARX_GETATT,
 };
 use untrusted::{AddressValidator, UntrustedRef, UntrustedRefMut, ValidateSlice};
 
@@ -120,7 +122,11 @@ impl<'a> AddressValidator for Handler<'a> {
     }
 }
 
-impl<'a> SyscallHandler for Handler<'a> {
+impl<'a> SyscallHandler for Handler<'a> {}
+impl<'a> SystemSyscallHandler for Handler<'a> {}
+impl<'a> NetworkSyscallHandler for Handler<'a> {}
+
+impl<'a> BaseSyscallHandler for Handler<'a> {
     fn translate_shim_to_host_addr<T>(buf: *const T) -> usize {
         buf as _
     }
@@ -190,7 +196,9 @@ impl<'a> SyscallHandler for Handler<'a> {
 
         debugln!(self, ")");
     }
+}
 
+impl<'a> ProcessSyscallHandler for Handler<'a> {
     /// Do an arch_prctl() syscall
     fn arch_prctl(&mut self, code: libc::c_int, addr: libc::c_ulong) -> sallyport::Result {
         self.trace("arch_prctl", 2);
@@ -207,7 +215,9 @@ impl<'a> SyscallHandler for Handler<'a> {
 
         Ok(Default::default())
     }
+}
 
+impl<'a> FileSyscallHandler for Handler<'a> {
     /// Do a readv() syscall
     fn readv(
         &mut self,
@@ -297,7 +307,9 @@ impl<'a> SyscallHandler for Handler<'a> {
 
         Ok(ret)
     }
+}
 
+impl<'a> MemorySyscallHandler for Handler<'a> {
     /// Do a brk() system call
     fn brk(&mut self, addr: *const u8) -> sallyport::Result {
         self.trace("brk", 1);
@@ -347,11 +359,11 @@ impl<'a> SyscallHandler for Handler<'a> {
     }
 
     /// Do a munmap() system call
-    fn munmap(&mut self, addr: UntrustedRef<u8>, lenght: libc::size_t) -> sallyport::Result {
+    fn munmap(&mut self, addr: UntrustedRef<u8>, length: libc::size_t) -> sallyport::Result {
         self.trace("munmap", 2);
 
         let mut heap = unsafe { Heap::new(self.layout.heap.into()) };
-        heap.munmap::<libc::c_void>(addr.as_ptr() as _, lenght)?;
+        heap.munmap::<libc::c_void>(addr.as_ptr() as _, length)?;
         Ok(Default::default())
     }
 
@@ -366,21 +378,37 @@ impl<'a> SyscallHandler for Handler<'a> {
         self.trace("madvise", 3);
         Ok(Default::default())
     }
+}
 
-    // Stub for get_attestation() pseudo syscall
-    // See: https://github.com/enarx/enarx-keepldr/issues/31
-    // NOTE: The Report will never be passed in from the code layer,
-    // so the nonce fields are not useful from the code --> shim in SGX.
-    // But SEV also uses this function signature and needs these fields.
-    // So we throw these two parameters away.
+impl<'a> EnarxSyscallHandler for Handler<'a> {
+    // NOTE: The 'nonce' field is called 'hash' here, as it is used to pass in
+    // a hash of a public key from the client that is to be embedded in the Quote.
+    // For more on this syscall, see: https://github.com/enarx/enarx-keepldr/issues/31
     fn get_attestation(
         &mut self,
-        _: UntrustedRef<u8>,
-        _: libc::size_t,
+        hash: UntrustedRef<u8>,
+        hash_len: libc::size_t,
         buf: UntrustedRefMut<u8>,
         buf_len: libc::size_t,
     ) -> sallyport::Result {
         self.trace("get_att", 0);
+
+        // If hash is NULL ptr, it is a Quote size request; return expected Quote size
+        // without proxying to host. Otherwise get hash value.
+        let hash = match hash.validate_slice(hash_len, self) {
+            None => {
+                let rep: sallyport::Reply = Ok([SGX_QUOTE_SIZE.into(), SGX_TECH.into()]).into();
+                return sallyport::Result::from(rep);
+            }
+            Some(h) => {
+                if h.len() != 64 {
+                    return Err(libc::EINVAL);
+                }
+                let mut hash = [0u8; 64];
+                hash.copy_from_slice(h);
+                hash
+            }
+        };
 
         // Used internally for buffer size to host when getting TargetInfo
         const REPORT_LEN: usize = 512;
@@ -426,8 +454,7 @@ impl<'a> SyscallHandler for Handler<'a> {
         );
         target_info.mrenclave.copy_from_slice(&ti[0..32]);
         target_info.attributes = att;
-        let data = ReportData([0u8; 64]);
-        let report: Report = unsafe { target_info.get_report(&data) };
+        let report: Report = unsafe { target_info.get_report(&ReportData(hash)) };
 
         // Request Quote from host
         let report_slice = &[report];

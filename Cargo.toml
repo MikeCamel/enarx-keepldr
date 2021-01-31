@@ -32,13 +32,10 @@ backend-sgx = ["sgx"]
 
 [dependencies]
 #sev = { git = "https://github.com/connorkuehl/sev", branch = "serdles-all-the-way-down", features = ["openssl"], optional = true }
-#ev = { path = "../sev", features = ["openssl"], optional = true}
 sev = { git = "https://github.com/enarx/sev", features = ["openssl"], optional = true}
-sgx = { git = "https://github.com/enarx/sgx", rev = "5292e53", features = ["asm", "crypto"], optional = true }
-#koine = { git = "https://github.com/MikeCamel/koine", branch="poc-dependencies", optional = true }
-#koine = { git = "https://github.com/enarx/koine", optional = true }
-#koine = { git = "https://github.com/connorkuehl/koine", branch = "serdles-all-the-way-down", optional = true }
+sgx = { git = "https://github.com/lkatalin/sgx", branch = "hasher", features = ["asm", "crypto"], optional = true }
 koine = { path = "../koine", optional = true}
+
 x86_64 = { version = "0.11", default-features = false, features = ["stable"], optional = true }
 kvm-bindings = { version = "0.3", optional = true }
 kvm-ioctls = { version = "0.6", optional = true }
@@ -65,6 +62,22 @@ walkdir = "2"
 protobuf-codegen-pure = "2.3"
 
 [dev-dependencies]
-process_control = "2.0"
+process_control = "3.0"
 serial_test = "0.5"
 tempdir = "0.3.7"
+
+[[example]]
+name="echo"
+path="tests/bin/echo.rs"
+
+[[example]]
+name="memory_stress_test"
+path="tests/bin/memory_stress_test.rs"
+
+[[example]]
+name="memspike"
+path="tests/bin/memspike.rs"
+
+[[example]]
+name="unix_echo"
+path="tests/bin/unix_echo.rs"

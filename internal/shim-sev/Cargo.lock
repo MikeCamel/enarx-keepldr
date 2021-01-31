@@ -20,9 +20,9 @@ checksum = "cf1de2fe8c75bc145a2f577add951f8134889b4795d47466a54a5c846d691693"
 
 [[package]]
 name = "compiler_builtins"
-version = "0.1.38"
+version = "0.1.39"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "475f939b731d862c8efe7001757c5d7c80978e00ef2923d60d90a6f0cb184c6b"
+checksum = "3748f82c7d366a0b4950257d19db685d4958d2fa27c6d164a3f069fec42b748b"
 
 [[package]]
 name = "crt0stack"
@@ -32,9 +32,9 @@ checksum = "9274b445ee572d50bdeb17a1101be829becc565b5c12b21a697af4d360b48e8d"
 
 [[package]]
 name = "goblin"
-version = "0.3.0"
+version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c69552f48b18aa6102ce0c82dd9bc9d3f8af5fc0a5797069b1b466b90570e39c"
+checksum = "240f5af179d11cd2a3339fc2e6c06f7410ed0b0cc3a54786efb8013699d146f6"
 dependencies = [
  "plain",
  "scroll",
@@ -42,9 +42,15 @@ dependencies = [
 
 [[package]]
 name = "libc"
-version = "0.2.81"
+version = "0.2.82"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1482821306169ec4d07f6aca392a4681f66c75c9918aa49641a2595db64053cb"
+checksum = "89203f3fba0a3795506acaad8ebce3c80c0af93f994d5a1d7a0b1eeb23271929"
+
+[[package]]
+name = "linked_list_allocator"
+version = "0.8.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "822add9edb1860698b79522510da17bef885171f75aa395cff099d770c609c24"
 
 [[package]]
 name = "lock_api"
@@ -116,6 +122,7 @@ dependencies = [
  "crt0stack",
  "goblin",
  "libc",
+ "linked_list_allocator",
  "lset",
  "nbytes",
  "primordial",
@@ -155,9 +162,9 @@ dependencies = [
 
 [[package]]
 name = "x86_64"
-version = "0.12.3"
+version = "0.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "79872a41412b9f91e72b24ab7f057ba500b5776349c5106d0b2e064e97ff1252"
+checksum = "5d74944372d63f31dd39fce1ef8036143484ff4cd4efcd743ef50135839de4e7"
 dependencies = [
  "bit_field",
  "bitflags",

@@ -6,17 +6,23 @@ use crate::addr::{HostVirtAddr, ShimPhysUnencryptedAddr};
 use crate::allocator::ALLOCATOR;
 use crate::asm::_enarx_asm_triple_fault;
 use crate::attestation::SEV_SECRET;
-use crate::eprintln;
 use crate::hostcall::{HostCall, HOST_CALL_ALLOC};
 use crate::paging::SHIM_PAGETABLE;
 use crate::payload::{NEXT_BRK_RWLOCK, NEXT_MMAP_RWLOCK};
+use crate::{eprintln, C_BIT_MASK};
 use core::convert::TryFrom;
 use core::mem::size_of;
 use core::ops::{Deref, DerefMut};
+use core::sync::atomic::Ordering;
 use primordial::{Address, Register};
 use sallyport::{Cursor, Request};
-use syscall::{SyscallHandler, ARCH_GET_FS, ARCH_GET_GS, ARCH_SET_FS, ARCH_SET_GS, SEV_TECH};
+use syscall::{
+    BaseSyscallHandler, EnarxSyscallHandler, FileSyscallHandler, MemorySyscallHandler,
+    NetworkSyscallHandler, ProcessSyscallHandler, SyscallHandler, SystemSyscallHandler,
+    ARCH_GET_FS, ARCH_GET_GS, ARCH_SET_FS, ARCH_SET_GS, SEV_TECH,
+};
 use untrusted::{AddressValidator, UntrustedRef, UntrustedRefMut, Validate, ValidateSlice};
+use x86_64::instructions::tlb::flush_all;
 use x86_64::registers::{rdfsbase, rdgsbase, wrfsbase, wrgsbase};
 use x86_64::structures::paging::{Page, PageTableFlags, Size4KiB};
 use x86_64::{align_up, VirtAddr};
@@ -161,7 +167,12 @@ impl AddressValidator for Handler {
     }
 }
 
-impl SyscallHandler for Handler {
+impl SyscallHandler for Handler {}
+impl SystemSyscallHandler for Handler {}
+impl NetworkSyscallHandler for Handler {}
+impl FileSyscallHandler for Handler {}
+
+impl BaseSyscallHandler for Handler {
     fn unknown_syscall(
         &mut self,
         _a: Register<usize>,
@@ -205,7 +216,9 @@ impl SyscallHandler for Handler {
 
         eprintln!(")");
     }
+}
 
+impl EnarxSyscallHandler for Handler {
     fn get_attestation(
         &mut self,
         _nonce: UntrustedRef<u8>,
@@ -230,10 +243,18 @@ impl SyscallHandler for Handler {
 
                 Ok([result_len.into(), SEV_TECH.into()])
             }
-            None => Err(libc::ENOSYS),
+            None => {
+                if C_BIT_MASK.load(Ordering::Relaxed) == 0 {
+                    Err(libc::ENOSYS)
+                } else {
+                    Ok([0.into(), SEV_TECH.into()])
+                }
+            }
         }
     }
+}
 
+impl ProcessSyscallHandler for Handler {
     fn arch_prctl(&mut self, code: i32, addr: u64) -> sallyport::Result {
         self.trace("arch_prctl", 2);
         match code {
@@ -275,7 +296,9 @@ impl SyscallHandler for Handler {
             }
         }
     }
+}
 
+impl MemorySyscallHandler for Handler {
     fn mprotect(&mut self, addr: UntrustedRef<u8>, len: usize, prot: i32) -> sallyport::Result {
         self.trace("mprotect", 3);
         let addr = addr.as_ptr();
@@ -301,7 +324,7 @@ impl SyscallHandler for Handler {
         for page in page_range {
             unsafe {
                 match page_table.update_flags(page, flags) {
-                    Ok(flush) => flush.flush(),
+                    Ok(flush) => flush.ignore(),
                     Err(e) => {
                         eprintln!(
                             "SC> mprotect({:#?}, {}, {}, …) = EINVAL ({:#?})",
@@ -312,6 +335,9 @@ impl SyscallHandler for Handler {
                 }
             }
         }
+
+        flush_all();
+
         eprintln!("SC> mprotect({:#?}, {}, {}, …) = 0", addr, len, prot);
 
         Ok(Default::default())
@@ -377,8 +403,20 @@ impl SyscallHandler for Handler {
         }
     }
 
-    fn munmap(&mut self, _addr: UntrustedRef<u8>, _lenght: usize) -> sallyport::Result {
+    fn munmap(&mut self, addr: UntrustedRef<u8>, length: usize) -> sallyport::Result {
         self.trace("munmap", 2);
+
+        let addr = addr.validate_slice(length, self).ok_or(libc::EINVAL)?;
+
+        ALLOCATOR
+            .write()
+            .unmap_memory(
+                SHIM_PAGETABLE.write().deref_mut(),
+                VirtAddr::from_ptr(addr.as_ptr()),
+                length,
+            )
+            .map_err(|_| libc::EINVAL)?;
+
         Ok(Default::default())
     }
 

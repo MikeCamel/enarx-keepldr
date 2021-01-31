@@ -284,7 +284,11 @@ fn attestation_bridge(sock: Option<&Path>) -> Result<UnixStream> {
         None => {
             println!("No path found");
             let (synthetic_client, sock) = UnixStream::pair()?;
-            std::thread::spawn(move || unattested_launch::launch(synthetic_client));
+            std::thread::spawn(move || {
+                if let Err(e) = unattested_launch::launch(synthetic_client) {
+                    eprintln!("\nattestation_bridge Error: {:?}", e)
+                }
+            });
             sock
         }
     };
