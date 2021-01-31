@@ -59,7 +59,8 @@
 //!
 //!     Edit the files in external/ to reflect your local paths
 //!     
-//!     //Copy (or link) the files in external/*.service to ~/.config/systemd/user/
+//!     Copy (or link) the files in external/*.service to ~/.config/systemd/user/
+//!        (on some systems, this may be ~/.config/systemd/user.config/)
 //!     
 //!     May require:
 //!     
@@ -205,7 +206,7 @@ fn kuuid(_backends: &[Box<dyn Backend>], kuuid: Kuuid) -> Result<()> {
 #[allow(clippy::unnecessary_wraps)]
 fn measure(backends: &[Box<dyn Backend>], opts: Report) -> Result<()> {
     let keep = std::env::var_os("ENARX_BACKEND").map(|x| x.into_string().unwrap());
-
+    
     let backend = backends
         .iter()
         .filter(|b| keep.is_none() || keep == Some(b.name().into()))
@@ -228,25 +229,29 @@ fn measure(backends: &[Box<dyn Backend>], opts: Report) -> Result<()> {
 #[allow(unreachable_code)]
 #[allow(clippy::unnecessary_wraps)]
 fn exec(backends: &[Box<dyn Backend>], opts: Exec) -> Result<()> {
+    for b in backends {
+        println!("[keepldr] Available backend = {:?}", b.name());
+    }
     let keep = std::env::var_os("ENARX_BACKEND").map(|x| x.into_string().unwrap());
-    //println!("keep = {:?}", keep);
+    println!("keep = {:?}", keep);
     let backend = backends
         .iter()
         .filter(|b| keep.is_none() || keep == Some(b.name().into()))
         .find(|b| b.have());
 
     if let Some(backend) = backend {
-        //println!("We seem to have a backend");
+        println!("[keepldr] We have a backend");
         let code = Component::from_path(&opts.code)?;
-        //println!("No problem with code");
-        //println!("About to try building backend with {:?}", &opts.sock.as_deref().unwrap());
+        println!("[keepldr] code loaded");
+        println!("About to try building backend with {:?}", &opts.sock.as_deref().unwrap());
         let keep = backend.build(code, opts.sock.as_deref())?;
 
-        //println!("A keep has been built!");
+        println!("[keepldr] A keep has been built");
         let mut thread = keep.clone().add_thread()?;
         loop {
             match thread.enter()? {
                 Command::SysCall(block) => unsafe {
+                    println!("About to make syscall");
                     block.msg.rep = block.msg.req.syscall();
                 },
                 Command::Continue => (),
